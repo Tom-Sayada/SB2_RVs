@@ -36,8 +36,8 @@ def compute_slope(df_rvs):
     """
     rv1 = df_rvs['RV1'].values
     rv2 = df_rvs['RV2'].values
-    rv1_err = df_rvs['RV1_uncertainty'].values
-    rv2_err = df_rvs['RV2_uncertainty'].values
+    rv1_err = df_rvs['RV1_err'].values
+    rv2_err = df_rvs['RV2_err'].values
 
     rv1_err[rv1_err <= 0] = 1e-5
     rv2_err[rv2_err <= 0] = 1e-5
@@ -95,18 +95,18 @@ def main():
                     continue
 
                 # Grab the "GLOBAL" row
-                df_global = df_chi[df_chi['Line'] == 'GLOBAL']
+                df_global = df_chi[df_chi['Line_ID'] == 'GLOBAL']
                 if len(df_global) == 1:
                     row_g = df_global.iloc[0]
-                    global_chi2_r = row_g['Chi_square_reduced']
+                    global_chi2_r = row_g['Chi2_reduced']
                     global_p_val  = row_g['p_value']
-                    ratio_val     = row_g.get('ratio', np.nan)
-                    ratio_err     = row_g.get('ratio_err', np.nan)
                 else:
                     global_chi2_r = np.nan
                     global_p_val  = np.nan
-                    ratio_val     = np.nan
-                    ratio_err     = np.nan
+
+                # ratio param (if present)
+                ratio_val = df_global.get('ratio', np.nan)
+                ratio_err = df_global.get('ratio_err', np.nan)
 
                 # optional: slope from RV2 vs RV1
                 slope, slope_err = compute_slope(df_rvs)
@@ -122,8 +122,8 @@ def main():
                     'Q': Q,
                     'Global_Chi2r': global_chi2_r,
                     'Global_PValue': global_p_val,
-                    'Ratio': ratio_val,
-                    'Ratio_Err': ratio_err,
+                    'Ratio': ratio_val if not pd.isna(ratio_val).all() else np.nan,
+                    'Ratio_Err': ratio_err if not pd.isna(ratio_err).all() else np.nan,
                     'RV2_RV1_Slope': slope,
                     'RV2_RV1_Slope_Err': slope_err
                 })

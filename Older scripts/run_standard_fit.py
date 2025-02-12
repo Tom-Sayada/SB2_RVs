@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+
+"""
+run_standard_fit.py
+
+Example script that:
+  - For each line + epoch, defines a wide search window around rest wavelength
+  - Smooths flux in that window to find approximate line center
+  - Re-centers a final narrower window
+  - Builds arrays and runs an SB2 fit in the 'standard' approach
+  - Saves final best-fit parameters to JSON for the ratio fit.
+"""
+
+import os
+import argparse
+import json
+import numpy as np
+from tqdm import tqdm
+from lmfit import Minimizer, report_fit
+
+# Local modules
+from src.utils import (
+    find_observation_files,
+    load_data_for_epoch,
+    find_noise_regions,
+    find_line_center_smoothed
+)
+from src.model_builder import (
+    setup_parameters,     # standard approach
+    residuals            # standard approach
+)
+from src.plot_results import report_fit_results
+
+class BasinHoppingCallback:
+    def __init__(self, niter):
+        self.niter = niter
+        self.current = 0
+        self.pbar = tqdm(total=niter, desc="Basin hopping")
+
+    def __call__(self, x, f, accept):
+        self.current += 1
+        self.pbar.update(1)
+        return False
+
+    def close(self):
+        self.pbar.close()
+
+
+def save_bestfit_params_to_json(params, filepath):
+    """
+    Save the best-fit parameters to a JSON file, e.g.:
+    {
+      "param_name": {"value": float, "min": float, "max": float},
+      ...
+    }
+    """
+    data = {}
+    for key, par in params.items():
+        data[key] = {
+            "value": par.value,
+            "min": par.min,
+            "max": par.max
+        }
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved best-fit parameters to '{filepath}'")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SB2 multi-line fit with dynamic line-windowing (standard)."
+    )
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--output_dir", type=str, default="output_fit_results")
+    parser.add_argument("--profile_type", type=str, default='sym')
+    parser.add_argument("--lines", type=str, default=None,
+                        help="Comma-separated e.g. 'He4471,He4026,H4340'")
+    parser.add_argument("--unweighted", action='store_true')
+    parser.add_argument("--fit_baseline", action='store_true')
+    parser.add_argument("--save_params_json", type=str, default="standard_fit_params.json",
+                        help="Where to save the final best-fit parameters (JSON)")
+    args = parser.parse_args()
+
+    data_dir = args.data_dir
+    out_dir = args.output_dir
+    profile_type = args.profile_type.strip().lower()
+    use_weighted = (not args.unweighted)
+    fit_baseline = bool(args.fit_baseline)
+    save_path = args.save_params_json
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Example lines
+    all_lines_info = {
+        'He4471': {'rest_wave': 4471.5, 'window': 20.0},
+        'He4026': {'rest_wave': 4026.0, 'window': 20.0},
+        'He4388': {'rest_wave': 4388.0, 'window': 20.0},
+        'H4340':  {'rest_wave': 4340.472, 'window': 20.0}
+    }
+
+    # If user specified lines
+    if args.lines:
+        requested = [ln.strip() for ln in args.lines.split(',') if ln.strip()]
+        spectral_lines = {}
+        for r in requested:
+            if r not in all_lines_info:
+                raise ValueError(f"Line '{r}' not recognized.")
+            spectral_lines[r] = all_lines_info[r]
+    else:
+        spectral_lines = all_lines_info
+
+    print(f"\nData from: {data_dir}")
+    print(f"Output:   {out_dir}")
+    print(f"Fitting lines: {list(spectral_lines.keys())}")
+    print(f"Profile type: {profile_type}, Weighted={use_weighted}, Baseline={fit_baseline}\n")
+
+    # Find observation files
+    epoch_files = find_observation_files(data_dir)
+    if not epoch_files:
+        raise ValueError(f"No observation files found in {data_dir}.")
+
+    from collections import OrderedDict
+    # Data structures for fitting
+    fit_wv = OrderedDict()
+    fit_fl = OrderedDict()
+    fit_un = OrderedDict()
+    fit_ep = OrderedDict()
+    fit_noise = {}
+
+    # Data structures for plotting
+    plot_wv = OrderedDict()
+    plot_fl = OrderedDict()
+    plot_un = OrderedDict()
+    plot_ep = OrderedDict()
+    plot_noise = {}
+
+    # Initialize
+    for ln_name, ln_info in spectral_lines.items():
+        line_id = f"line_{int(ln_info['rest_wave'] * 10)}"
+        fit_wv[line_id] = []
+        fit_fl[line_id] = []
+        fit_un[line_id] = []
+        fit_ep[line_id] = []
+        fit_noise[line_id] = {}
+
+        plot_wv[line_id] = []
+        plot_fl[line_id] = []
+        plot_un[line_id] = []
+        plot_ep[line_id] = []
+        plot_noise[line_id] = {}
+
+    print(f"Found {len(epoch_files)} files. Building arrays now...")
+    for (ep, filepath) in tqdm(epoch_files, desc="Loading data"):
+        df = load_data_for_epoch(filepath)
+        if df.empty:
+            continue
+
+        # For each line
+        for ln_name, ln_info in spectral_lines.items():
+            line_id = f"line_{int(ln_info['rest_wave'] * 10)}"
+            restw = ln_info['rest_wave']
+            halfw = ln_info['window'] / 2.0
+
+            # Big search window
+            search_extra = 25.0
+            search_min = restw - search_extra
+            search_max = restw + search_extra
+            mask_search = (df['wavelength'] >= search_min) & (df['wavelength'] <= search_max)
+            wv_search = df['wavelength'][mask_search].values
+            fl_search = df['flux'][mask_search].values
+            if len(wv_search) < 5:
+                continue
+
+            # Find approximate line center
+            found_center = find_line_center_smoothed(wv_search, fl_search, sigma=1.0, absorption=True)
+            if found_center is None:
+                found_center = restw
+
+            # Final narrower window
+            lw_min = found_center - halfw
+            lw_max = found_center + halfw
+            mask_fit = (df['wavelength'] >= lw_min) & (df['wavelength'] <= lw_max)
+            wv_fit = df['wavelength'][mask_fit].values
+            fl_fit = df['flux'][mask_fit].values
+            if len(wv_fit) == 0:
+                continue
+
+            # Estimate noise
+            nrs = find_noise_regions(df, lw_min, lw_max,
+                                     noise_window=5,
+                                     min_noise_separation=5,
+                                     max_noise_offset=80)
+            if len(nrs) > 0:
+                sig_list = []
+                for (nm, nM, dr) in nrs:
+                    mm = (df['wavelength'] >= nm) & (df['wavelength'] <= nM)
+                    fl_n = df['flux'][mm].values
+                    if len(fl_n) > 0:
+                        sig_list.append(fl_n.std())
+                if sig_list:
+                    epoch_sigma = np.mean(sig_list)
+                else:
+                    epoch_sigma = max(0.02, fl_fit.std())
+            else:
+                epoch_sigma = max(0.02, fl_fit.std())
+
+            # Store final arrays
+            fit_wv[line_id].append(wv_fit)
+            fit_fl[line_id].append(fl_fit)
+            fit_un[line_id].append(np.full_like(fl_fit, epoch_sigma))
+            fit_ep[line_id].append(np.full_like(fl_fit, ep, dtype=int))
+            fit_noise[line_id].setdefault(ep, [])
+            fit_noise[line_id][ep] = nrs
+
+            # For plotting
+            edges_min = [lw_min]
+            edges_max = [lw_max]
+            for (nm, nM, _) in nrs:
+                edges_min.append(nm)
+                edges_max.append(nM)
+            pm = min(edges_min)
+            pM = max(edges_max)
+            if pM <= pm:
+                pm = lw_min
+                pM = lw_max
+
+            mask_plot = (df['wavelength'] >= pm) & (df['wavelength'] <= pM)
+            wv_plot = df['wavelength'][mask_plot].values
+            fl_plot = df['flux'][mask_plot].values
+            if len(wv_plot) == 0:
+                continue
+
+            plot_wv[line_id].append(wv_plot)
+            plot_fl[line_id].append(fl_plot)
+            plot_un[line_id].append(np.full_like(fl_plot, epoch_sigma))
+            plot_ep[line_id].append(np.full_like(fl_plot, ep, dtype=int))
+            plot_noise[line_id].setdefault(ep, [])
+            plot_noise[line_id][ep] = nrs
+
+    # Flatten arrays
+    all_ep = set()
+    for line_id in fit_wv:
+        if len(fit_wv[line_id]) > 0:
+            fit_wv[line_id] = np.concatenate(fit_wv[line_id])
+            fit_fl[line_id] = np.concatenate(fit_fl[line_id])
+            fit_un[line_id] = np.concatenate(fit_un[line_id])
+            fit_ep[line_id] = np.concatenate(fit_ep[line_id])
+            all_ep.update(fit_ep[line_id].tolist())
+        else:
+            fit_wv[line_id] = np.array([])
+            fit_fl[line_id] = np.array([])
+            fit_un[line_id] = np.array([])
+            fit_ep[line_id] = np.array([])
+
+    for line_id in plot_wv:
+        if len(plot_wv[line_id]) > 0:
+            plot_wv[line_id] = np.concatenate(plot_wv[line_id])
+            plot_fl[line_id] = np.concatenate(plot_fl[line_id])
+            plot_un[line_id] = np.concatenate(plot_un[line_id])
+            plot_ep[line_id] = np.concatenate(plot_ep[line_id])
+        else:
+            plot_wv[line_id] = np.array([])
+            plot_fl[line_id] = np.array([])
+            plot_un[line_id] = np.array([])
+            plot_ep[line_id] = np.array([])
+
+    all_ep = np.unique(list(all_ep))
+    if len(all_ep) == 0:
+        print("No data => exit.")
+        return
+
+    # Map line ID -> rest wavelength
+    central_map = {}
+    for ln_name, ln_info in spectral_lines.items():
+        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        central_map[lid] = ln_info['rest_wave']
+
+    # Setup standard approach parameters
+    params = setup_parameters(
+        central_wavelengths=central_map,
+        all_epochs=all_ep,
+        profile_type=profile_type,
+        fit_baseline=fit_baseline
+    )
+
+    # Minimizer
+    minimizer = Minimizer(
+        residuals,
+        params,
+        fcn_args=(fit_wv, fit_fl, fit_ep, fit_un, central_map),
+        fcn_kws={'profile_type': profile_type, 'weighted': use_weighted}
+    )
+
+    # Basin hopping
+    callback = BasinHoppingCallback(niter=10)
+    try:
+        result_bh = minimizer.minimize(
+            method='basinhopping',
+            niter=10,
+            T=5.0,
+            stepsize=0.3,
+            callback=callback,
+            minimizer_kwargs={'method': 'L-BFGS-B'}
+        )
+    finally:
+        callback.close()
+
+    print("\nRefining with least squares...")
+    result_final = minimizer.minimize(
+        method='leastsq',
+        params=result_bh.params,
+        max_nfev=20000
+    )
+
+    print("\n===== Fit Report =====\n")
+    report_fit(result_final)
+
+    # Summaries & final plots
+    windows_map = {}
+    for ln_name, ln_info in spectral_lines.items():
+        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        windows_map[lid] = ln_info['window']
+
+    df_res, df_chi = report_fit_results(
+        result=result_final,
+        wavelengths_line=fit_wv,
+        fluxes_line=fit_fl,
+        uncertainties_line=fit_un,
+        epochs_line=fit_ep,
+        central_wavelengths=central_map,
+        noise_regions=fit_noise,
+        windows=windows_map,
+        output_directory=out_dir,
+        profile_type=profile_type,
+        plot_wavelengths_line=plot_wv,
+        plot_fluxes_line=plot_fl,
+        plot_uncertainties_line=plot_un,
+        plot_epochs_line=plot_ep,
+        plot_noise_dict=plot_noise
+    )
+
+    print(f"\nAll done. Results in {out_dir}\n")
+
+    # Save best-fit parameters to JSON for ratio fit
+    save_bestfit_params_to_json(result_final.params, os.path.join(out_dir, save_path))
+
+if __name__ == "__main__":
+    main()

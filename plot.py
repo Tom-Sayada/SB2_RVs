@@ -15,15 +15,39 @@ except ImportError:
         f = interp1d(old_wavs, old_flux, bounds_error=False, fill_value="extrapolate")
         return f(new_wavs)
 
-
 # Mock functions for unsupported file types
 def read_fits(infile):
     print(f"Reading FITS file: {infile}")
-    with fits.open(infile) as hdul:
-        wave = np.arange(len(hdul[0].data))
-        flux = hdul[0].data
-    return wave, flux
+    try:
+        with fits.open(infile) as hdul:
+            # Print HDU information for debugging
+            hdul.info()
 
+            # Check all HDUs for data
+            for i, hdu in enumerate(hdul):
+                print(f"Inspecting HDU {i}: {type(hdu)}")
+
+                # Check if it's a Binary Table HDU
+                if isinstance(hdu, fits.BinTableHDU):
+                    print("Found Binary Table HDU")
+                    table_data = hdu.data
+                    print(f"Columns: {table_data.columns.names}")
+
+                    # Check if WAVELENGTH and SCI_NORM columns exist
+                    if 'WAVELENGTH' in table_data.columns.names and 'SCI_NORM' in table_data.columns.names:
+                        wavelength = table_data['WAVELENGTH']
+                        sci_norm = table_data['SCI_NORM']
+                        return wavelength, sci_norm
+                    else:
+                        print("Required columns 'WAVELENGTH' and 'SCI_NORM' not found in Binary Table.")
+
+            # If no Binary Table HDU or required columns are found
+            print("No suitable data found in the FITS file.")
+            wave, flux = None, None
+    except Exception as e:
+        print(f"Error reading FITS file: {e}")
+        wave, flux = None, None
+    return wave, flux
 
 def read_ascii(infile, col0=0, col1=1, comment='#', SkipLines=0):
     print(f"Reading ASCII file: {infile}")
@@ -36,14 +60,12 @@ def read_ascii(infile, col0=0, col1=1, comment='#', SkipLines=0):
         wave, flux = None, None
     return wave, flux
 
-
 def read_file(infile, col0=0, col1=1, comment='#', SkipLines=0):
     ext = infile.split('.')[-1]
     if ext in ['fits', 'fit']:
         return read_fits(infile)
     else:
         return read_ascii(infile, col0, col1, comment, SkipLines)
-
 
 # File selection
 def select_files():
@@ -54,7 +76,6 @@ def select_files():
         filetypes=[("All files", "*.*")]
     )
     return list(file_paths)
-
 
 # Parameters
 Legend = True
@@ -72,17 +93,21 @@ fig, ax = plt.subplots()
 
 # Process files
 for infile in selected_files:
-    wave_in, flux_in = read_file(infile)
-    if wave_in is None or flux_in is None:
-        continue
+    try:
+        wave_in, flux_in = read_file(infile)
+        if wave_in is None or flux_in is None:
+            print(f"Skipping file: {infile}")
+            continue
 
-    flux_in = np.nan_to_num(flux_in, nan=1.0)
+        flux_in = np.nan_to_num(flux_in, nan=1.0)
 
-    if Norm:
-        flux_in /= np.mean(flux_in)
+        if Norm:
+            flux_in /= np.mean(flux_in)
 
-    label = infile.split("/")[-1]
-    ax.plot(wave_in, flux_in, linewidth=1.0, alpha=0.8, label=label)
+        label = infile.split("/")[-1]
+        ax.plot(wave_in, flux_in, linewidth=1.0, alpha=0.8, label=label)
+    except Exception as e:
+        print(f"Error processing file {infile}: {e}")
 
 # Spectral lines for O and B stars
 lines_b_stars = {'He I 4471': 4471, 'Mg II 4481': 4481}
@@ -104,6 +129,7 @@ plt.show()
 if SaveTxt:
     for infile in selected_files:
         wave_in, flux_in = read_file(infile)
-        output_file = infile.split('/')[-1] + '_output.txt'
-        np.savetxt(output_file, np.c_[wave_in, flux_in])
-        print(f"Saved file: {output_file}")
+        if wave_in is not None and flux_in is not None:
+            output_file = infile.split('/')[-1] + '_output.txt'
+            np.savetxt(output_file, np.c_[wave_in, flux_in])
+            print(f"Saved file: {output_file}")

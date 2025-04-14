@@ -1,0 +1,4 @@
+2025-03-23 13:42:07,516 - INFO - Selected parent folder: /Users/tomsayada/spectral_analysis_project/data/Good_SB2/Good_SB2_with_Balmer
+2025-03-23 13:42:19,368 - ERROR - Error processing 4-005: process_simulation_folder() got an unexpected keyword argument 'grid_step'
+2025-03-23 13:42:19,369 - ERROR - Error processing 4-059: process_simulation_folder() got an unexpected keyword argument 'grid_step'
+2025-03-23 13:42:19,369 - ERROR - Error processing 8-110: process_simulation_folder() got an unexpected keyword argument 'grid_step'

@@ -1,0 +1,70 @@
+import numpy as np
+import pandas as pd
+from tkinter import filedialog
+import os
+from scipy.ndimage import convolve1d
+
+
+models = r'/Users/zehavakatabi/Desktop/physics/model for b dwarfs/models, txt'
+vsini_list = r'/Users/zehavakatabi/Desktop/physics/Massive stars/vsini.csv'
+BLOeM_id = r'/Users/zehavakatabi/Desktop/physics/Massive stars/sample_id/id,B dwarf copy.txt'
+PathToOutput = r'/Users/zehavakatabi/Desktop/physics/model for b dwarfs/Models rotation'
+
+vsini_df = pd.read_csv(vsini_list)  
+
+
+with open(BLOeM_id, 'r') as f:
+    BLOeM_ids = [line.strip() for line in f]
+
+def rotational_broadening(ModWaves, ModFlux, v_rot, epsilon=0.):
+    """
+    Apply rotational broadening to a spectrum in linear wavelength scale.
+    Parameters:
+        ModWaves (np.ndarray): Array of wavelengths in Angstroms.
+        ModFlux (np.ndarray): Array of normalized flux values.
+        v_rot (float): Rotational velocity in km/s.
+        epsilon (float): Limb darkening coefficient (default is 0.6).
+    Returns:
+        np.ndarray: Rotationally broadened flux.
+    """
+    c = 299792.458  # speed of light in km/s
+    # Convert wavelength to logarithmic scale
+    log_wavelengths = np.log(ModWaves)
+    # Interpolate flux on a uniform logarithmic wavelength grid
+    delta_log_lambda = np.mean(np.diff(log_wavelengths))
+    log_wavelengths_uniform = np.arange(log_wavelengths.min(), log_wavelengths.max(), delta_log_lambda)
+    flux_uniform = np.interp(log_wavelengths_uniform, log_wavelengths, ModFlux)
+    # Convert v_rot to the equivalent delta_log_lambda
+    delta_log_lambda_vrot = v_rot / c
+    # Calculate the number of points needed to cover the broadening kernel
+    n_points = int(2 * delta_log_lambda_vrot / delta_log_lambda) + 1
+    x = np.linspace(-v_rot, v_rot, n_points)
+    kernel = np.zeros_like(x)
+    mask = np.abs(x) <= v_rot
+    kernel[mask] = (2 * (1 - epsilon) * np.sqrt(v_rot**2 - x[mask]**2) +
+                    epsilon * (v_rot**2 - x[mask]**2)) / v_rot**2
+    kernel /= np.sum(kernel)  # Normalize kernel
+    # Convolve the flux with the broadening kernel
+    broadened_flux_uniform = convolve1d(flux_uniform, kernel, mode='reflect')
+    # Interpolate back to the original wavelength grid
+    broadened_flux = np.interp(log_wavelengths, log_wavelengths_uniform, broadened_flux_uniform)
+    return broadened_flux
+
+for bloem_id in BLOeM_ids:
+    row_match = vsini_df.loc[vsini_df["ID"] == f"BLOeM_{bloem_id}", "vsini"]
+    if len(row_match) == 0:
+        print(f"Warning: No vsini found for {bloem_id}. Using 0 km/s.")
+        vsini_model = 0.0
+    else:
+        vsini_model = row_match.values[0]
+    model_name = f"model_BLOeM_{bloem_id}.txt"
+    model_path = out_csv = os.path.join(models, model_name)
+    df = pd.read_csv(model_path, sep='\s+')
+    w =  df['wavelength'].values
+    f = df['flux'].values
+    new_flux = rotational_broadening(w, f, vsini_model, epsilon=0.6)
+    out_csv = os.path.join(PathToOutput, f"model_roation_BLOeM_{bloem_id}.txt")
+    Mask_columns = np.column_stack([w, new_flux])
+    np.savetxt(out_csv, Mask_columns,delimiter=" ", comments="#", fmt="%.15f")
+
+print("Done!")

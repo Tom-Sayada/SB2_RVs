@@ -1,3 +1,5 @@
+# ratio_stats.py
+
 import os
 import re
 import pandas as pd
@@ -5,8 +7,25 @@ import numpy as np
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
+def process_simulation_folder(
+    base_path,
+    grid_step=None,
+    fine_grid_step=None,
+    grid_range=None
+):
+    """
+    Process a folder containing simulation_x subfolders to gather ratio-fitting stats.
+    Now also accepts optional grid search parameters:
+      - grid_step: float for coarse grid step size in km/s
+      - fine_grid_step: float for finer grid step size
+      - grid_range: float for +/- search range in km/s
+    """
 
-def process_simulation_folder(base_path):
+    # If these are provided, you can log or use them:
+    if grid_step is not None or fine_grid_step is not None or grid_range is not None:
+        print(f"ratio_stats.process_simulation_folder received grid parameters: "
+              f"grid_step={grid_step}, fine_grid_step={fine_grid_step}, grid_range={grid_range}")
+
     for parent_root, parent_dirs, _ in os.walk(base_path):
         # Identify parent folders containing simulation_x folders
         simulation_folders = [d for d in parent_dirs if d.startswith('simulation_')]
@@ -49,7 +68,9 @@ def process_simulation_folder(base_path):
                             sim_data.update({
                                 'ratio_calc_voigt': global_row['ratio'].values[0],
                                 'ratio_calc_voigt_err': global_row['ratio_err'].values[0],
-                                'real_calc_diff_over_err_voigt': abs(global_row['ratio'].values[0] - ratio_real) / global_row['ratio_err'].values[0]
+                                'real_calc_diff_over_err_voigt':
+                                    abs(global_row['ratio'].values[0] - ratio_real)
+                                    / global_row['ratio_err'].values[0]
                             })
                     except Exception as e:
                         print(f"Error reading voigt file {voigt_file}: {e}")
@@ -66,7 +87,9 @@ def process_simulation_folder(base_path):
                             sim_data.update({
                                 'ratio_calc_gaussian': global_row['ratio'].values[0],
                                 'ratio_calc_gaussian_err': global_row['ratio_err'].values[0],
-                                'real_calc_diff_over_err_gaussian': abs(global_row['ratio'].values[0] - ratio_real) / global_row['ratio_err'].values[0]
+                                'real_calc_diff_over_err_gaussian':
+                                    abs(global_row['ratio'].values[0] - ratio_real)
+                                    / global_row['ratio_err'].values[0]
                             })
                     except Exception as e:
                         print(f"Error reading gaussian file {gaussian_file}: {e}")
@@ -86,15 +109,15 @@ def process_simulation_folder(base_path):
                                 sim_data.update({
                                     'ratio_constrained_ratio': ratio_val,
                                     'ratio_constrained_ratio_err': ratio_err,
-                                    'real_calc_diff_over_err_ratio_constrained': abs(ratio_val - ratio_real) / ratio_err if ratio_err != 0 else np.nan
+                                    'real_calc_diff_over_err_ratio_constrained':
+                                        abs(ratio_val - ratio_real) / ratio_err if ratio_err != 0 else np.nan
                                 })
-                                print(f"Found ratio constrained VOIGT param for {simulation_folder}: {ratio_val} ± {ratio_err}")
+                                print(f"Found ratio constrained VOIGT param for {simulation_folder}: "
+                                      f"{ratio_val} ± {ratio_err}")
                     except Exception as e:
                         print(f"Error reading ratio file {ratio_file_voigt}: {e}")
 
-            # ----------------------------------------------------------------
-            # Process ratio-constrained GAUSSIAN fit # <-- NEW
-            # ----------------------------------------------------------------
+            # Process ratio-constrained GAUSSIAN fit
             ratio_folder_gauss = os.path.join(simulation_path, 'ratio_sym_gaussian_weighted_nobaseline_fit_results')
             if os.path.exists(ratio_folder_gauss):
                 ratio_file_gauss = os.path.join(ratio_folder_gauss, 'fit_results.xlsx')
@@ -107,11 +130,13 @@ def process_simulation_folder(base_path):
                             ratio_err = global_row['ratio_err'].values[0]
                             if pd.notnull(ratio_val) and pd.notnull(ratio_err):
                                 sim_data.update({
-                                    'ratio_constrained_gaussian_ratio': ratio_val,  # <-- NEW key
-                                    'ratio_constrained_gaussian_ratio_err': ratio_err,  # <-- NEW
-                                    'real_calc_diff_over_err_ratio_constrained_gaussian': abs(ratio_val - ratio_real) / ratio_err if ratio_err != 0 else np.nan  # <-- NEW
+                                    'ratio_constrained_gaussian_ratio': ratio_val,
+                                    'ratio_constrained_gaussian_ratio_err': ratio_err,
+                                    'real_calc_diff_over_err_ratio_constrained_gaussian':
+                                        abs(ratio_val - ratio_real) / ratio_err if ratio_err != 0 else np.nan
                                 })
-                                print(f"Found ratio constrained GAUSSIAN param for {simulation_folder}: {ratio_val} ± {ratio_err}")
+                                print(f"Found ratio constrained GAUSSIAN param for {simulation_folder}: "
+                                      f"{ratio_val} ± {ratio_err}")
                     except Exception as e:
                         print(f"Error reading ratio (gaussian) file {ratio_file_gauss}: {e}")
 
@@ -130,11 +155,9 @@ def process_simulation_folder(base_path):
                 errors = df_simulation['ratio_calc_voigt_err'].dropna()
                 ratios = df_simulation['ratio_calc_voigt'].dropna()
                 if len(errors) > 0 and len(ratios) > 0:
-                    # Suppose 'ratios' is an array of all ratio_i
-                    # and 'errors' is an array of all err_i (the 1σ for each ratio_i)
                     inv_var = 1.0 / (errors ** 2)  # 1 / σ_i^2
-                    sum_w = inv_var.sum()  # total weight
-                    sum_wr = (ratios * inv_var).sum()  # weighted sum
+                    sum_w = inv_var.sum()
+                    sum_wr = (ratios * inv_var).sum()
                     avg_ratio_weighted = sum_wr / sum_w
                     avg_ratio_weighted_err = np.sqrt(1.0 / sum_w)
 
@@ -142,7 +165,6 @@ def process_simulation_folder(base_path):
                     avg_error = avg_ratio_weighted_err
                     avg_uncertainty = abs(avg_ratio - ratio_real) / avg_error
 
-                    avg_uncertainty = abs(avg_ratio - ratio_real) / avg_error
                     summary_row.update({
                         'ratio_calc_voigt': avg_ratio,
                         'ratio_calc_voigt_err': avg_error,
@@ -177,9 +199,7 @@ def process_simulation_folder(base_path):
                         'real_calc_diff_over_err_ratio_constrained': avg_uncertainty
                     })
 
-            # ----------------------------------------------------------------
-            # 4) Ratio-constrained GAUSSIAN average # <-- NEW
-            # ----------------------------------------------------------------
+            # 4) Ratio-constrained GAUSSIAN average
             if 'ratio_constrained_gaussian_ratio' in df_simulation.columns:
                 errors = df_simulation['ratio_constrained_gaussian_ratio_err'].dropna()
                 ratios = df_simulation['ratio_constrained_gaussian_ratio'].dropna()
@@ -220,7 +240,6 @@ def process_simulation_folder(base_path):
                         break
 
             print(f"Saved parent folder summary to {output_file}")
-
 
 if __name__ == '__main__':
     base_path = "/Users/tomsayada/spectral_analysis_project/data/"

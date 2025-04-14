@@ -1,184 +1,236 @@
+#!/usr/bin/env python3
+
+"""
+animate_spectrum.py
+
+Creates an animation of line segments around specified spectral lines
+(across multiple observation epochs) by doppler-shifting each line
+to align with its rest wavelength. Works for both simulation-like data
+and real fits/txt observation files using your existing 'utils.py'.
+
+Usage:
+  python animate_spectrum.py
+  -> Will prompt you to pick a folder containing observation files
+     (like 'BLOeM_4-059_01_Combined.fits' or 'obs_123.txt', etc.).
+  -> Then it loads them in ascending epoch order using utils.find_observation_files,
+     extracts line segments for lines in 'lines_info', finds line centers,
+     shifts them to rest_wavelength, and animates them.
+"""
+
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import tkinter as tk
+from tkinter import filedialog
 
-# Dictionary of lines with their rest wavelengths and windows
+# Import from your SB2 project
+try:
+    from src.utils import find_observation_files, load_data_for_epoch
+except ImportError as e:
+    print("Could not import find_observation_files or load_data_for_epoch from src.utils.")
+    print("Make sure your project structure / PYTHONPATH is correct.")
+    raise e
+
+###############################################################################
+# Define which lines you want to animate. Adjust or add more as you like.
+###############################################################################
 lines_info = {
-    'He4471': {'wavelength': 4471.5, 'window': 20.0},
-    'He4026': {'wavelength': 4026.0, 'window': 20.0},
-    'He4388': {'wavelength': 4388.0, 'window': 20.0},
+    'He4471': {'rest_wavelength': 4471.5, 'window': 20.0},
+    'He4026': {'rest_wavelength': 4026.0, 'window': 20.0},
+    'He4388': {'rest_wavelength': 4388.0, 'window': 20.0},
+    'Hg4340': {'rest_wavelength': 4340.472, 'window': 20.0},
+    'Hd4101': {'rest_wavelength': 4101.734, 'window': 20.0},
 }
 
 
-def load_observation_files(input_folder):
+###############################################################################
+# A helper function to find the line center in a small sub-region
+# We assume absorption => min flux
+###############################################################################
+def find_line_center(wave, flux, rest_wl, search_window=5.0):
     """
-    Load all observation files. We will extract line segments later.
-    This function just loads the full wavelength and flux arrays for each epoch.
+    Look for min flux in [rest_wl - search_window, rest_wl + search_window].
+    Return the wavelength of that min flux. If no data, fallback to rest_wl.
     """
-    files = sorted(
-        [f for f in os.listdir(input_folder) if f.startswith('obs_') and not f.endswith('.gif')],
-        key=lambda x: int(x.split('_')[1])  # Assumes epoch number is the second field
-    )
-    observations = []
-
-    for file in files:
-        file_path = os.path.join(input_folder, file)
-
-        # Try to load the file with flexibility for different formats
-        try:
-            # Attempt to read it as a two-column plain text file
-            data = np.loadtxt(file_path, skiprows=1)  # Skip the header
-            wavelengths, flux = data[:, 0], data[:, 1]
-        except:
-            # Fall back for files with metadata
-            with open(file_path, 'r') as f:
-                lines = f.readlines()
-
-            data = []
-            for line in lines:
-                try:
-                    split_line = line.split()
-                    if len(split_line) >= 2:
-                        w, fl = float(split_line[0]), float(split_line[1])
-                        data.append((w, fl))
-                except:
-                    continue
-
-            data = np.array(data)
-            wavelengths, flux = data[:, 0], data[:, 1]
-
-        observations.append((wavelengths, flux))
-
-    return observations
-
-
-def find_line_center(wavelengths, flux, rest_wavelength, search_window=5.0):
-    """
-    Find the observed line center by searching for the wavelength corresponding to
-    the minimum flux (assuming absorption line) within a small window around the rest wavelength.
-
-    If your lines are emission lines, you might want to find the maximum flux instead.
-    """
-    mask = (wavelengths >= rest_wavelength - search_window) & (wavelengths <= rest_wavelength + search_window)
+    mask = (wave >= rest_wl - search_window) & (wave <= rest_wl + search_window)
     if not np.any(mask):
-        # No data in this range, return the rest wavelength as fallback
-        return rest_wavelength
+        return rest_wl  # fallback
 
-    sub_wl = wavelengths[mask]
-    sub_flux = flux[mask]
+    subw = wave[mask]
+    subf = flux[mask]
 
-    # Find the index of minimum flux (for absorption line)
-    min_idx = np.argmin(sub_flux)
-    line_center = sub_wl[min_idx]
-    return line_center
+    idx_min = np.argmin(subf)
+    return subw[idx_min]
 
 
-def get_line_data_for_observations(observations, lines_info):
+###############################################################################
+# This function extracts the line windows for each epoch & line,
+# finds the line center, and shifts so that line center => rest_wavelength.
+###############################################################################
+def extract_shifted_line_data(observations, lines_info):
     """
-    For each line, extract the wavelength and flux arrays from each epoch,
-    and shift them so that the line center matches the rest wavelength.
-    Returns a dictionary keyed by line name with a list of (wavelength, flux) arrays for each epoch.
-    """
-    line_data = {line_name: [] for line_name in lines_info}
+    observations: list of (wavelength array, flux array) per epoch
+    lines_info: dict line_name => {'rest_wavelength': X, 'window': Y}
 
-    for (wavelengths, flux) in observations:
-        # For each epoch, find line segments for each line
+    Returns:
+      line_data = { line_name: [ (shifted_wave, flux) for each epoch ] }
+    """
+    line_data = {}
+    for line_name, line_params in lines_info.items():
+        line_data[line_name] = []
+
+    for (wave_all, flux_all) in observations:
+        # For each epoch, for each line
         for line_name, line_params in lines_info.items():
-            rest_wl = line_params['wavelength']
+            rest_wl = line_params['rest_wavelength']
             window = line_params['window']
-            # Extract the line region
-            mask = (wavelengths >= rest_wl - window) & (wavelengths <= rest_wl + window)
+
+            # subset wave, flux in [rest_wl - window, rest_wl + window]
+            mask = (wave_all >= rest_wl - window) & (wave_all <= rest_wl + window)
             if not np.any(mask):
-                # If no data in range, skip
+                # no data => store None
                 line_data[line_name].append((None, None))
                 continue
 
-            sub_wl = wavelengths[mask]
-            sub_flux = flux[mask]
+            subw = wave_all[mask]
+            subf = flux_all[mask]
 
-            # Find the observed line center
-            observed_center = find_line_center(sub_wl, sub_flux, rest_wl, search_window=5.0)
+            # find observed center
+            obs_center = find_line_center(subw, subf, rest_wl, search_window=5.0)
 
-            # Doppler shift: we want to shift the wavelength array so that the observed_center aligns with rest_wl
-            # The shift needed:
-            shift = rest_wl - observed_center
-            shifted_wl = sub_wl + shift
-
-            line_data[line_name].append((shifted_wl, sub_flux))
+            # shift wave array so that obs_center => rest_wl
+            shift = rest_wl - obs_center
+            shifted_wave = subw + shift
+            # store
+            line_data[line_name].append((shifted_wave, subf))
 
     return line_data
 
 
-def animate_spectrum(input_folder, lines_info, output_gif=None):
-    """
-    Animate the spectra for the specified lines, doppler shifted to line center.
-    Shows all three lines on separate subplots.
-    """
-    # Load all observations
-    observations = load_observation_files(input_folder)
-    if not observations:
-        print("No observations found in the specified folder.")
+###############################################################################
+# The main animation function
+###############################################################################
+def animate_spectrum(folder_path, lines_info, output_gif=None):
+    # 1) find observation files
+    try:
+        obs_files = find_observation_files(folder_path)
+    except Exception as e:
+        print(f"Error searching for observation files in {folder_path}: {e}")
         return
 
-    # Extract and shift line data
-    line_data = get_line_data_for_observations(observations, lines_info)
+    if not obs_files:
+        print("No observation files found.")
+        return
 
-    # Check if we have data for each line
-    for line_name in lines_info:
-        if all(d[0] is None for d in line_data[line_name]):
-            print(f"No data found for line {line_name}")
-            return
+    print(f"Found {len(obs_files)} observation files in {folder_path}")
 
-    # Create figure with one subplot per line
-    fig, axes = plt.subplots(nrows=1, ncols=len(lines_info), figsize=(15, 5))
-    if len(lines_info) == 1:
-        axes = [axes]  # Ensure axes is a list if only one line
+    # 2) load data for each epoch in ascending order
+    observations = []
+    for (ep, fpath) in sorted(obs_files, key=lambda x: x[0]):
+        df = load_data_for_epoch(fpath)
+        if df.empty:
+            print(f"Warning: epoch {ep} => no data.")
+            # store None?
+            observations.append((np.array([]), np.array([])))
+            continue
 
+        # convert to numpy arrays
+        wave = df['wavelength'].values
+        flux = df['flux'].values
+        observations.append((wave, flux))
+
+    if not observations:
+        print("No loaded data => exit.")
+        return
+
+    # 3) shift lines
+    line_data = extract_shifted_line_data(observations, lines_info)
+
+    # 4) Build the animation figure with subplots => one per line
+    n_lines = len(lines_info)
+    fig, axes = plt.subplots(nrows=1, ncols=n_lines, figsize=(5 * n_lines, 5))
+    if n_lines == 1:
+        axes = [axes]
+
+    # pre-define line artists
     line_artists = {}
-    titles = {}
-    for ax, (line_name, line_params) in zip(axes, lines_info.items()):
-        (wls, flx) = next((w, f) for (w, f) in line_data[line_name] if w is not None)
-        ax.set_xlim(line_params['wavelength'] - line_params['window'],
-                    line_params['wavelength'] + line_params['window'])
-        # You might want to dynamically set y-limits based on data
-        ax.set_ylim(np.min(flx) * 0.9, np.max(flx) * 1.1 if np.max(flx) * 1.1 > 0 else 1.1)
+    line_names = list(lines_info.keys())
 
+    # For each subplot/line
+    for ax, line_name in zip(axes, line_names):
+        # find the first non-None entry for x-limits
+        wave_example, flux_example = None, None
+        for (w, f) in line_data[line_name]:
+            if w is not None and len(w) > 0:
+                wave_example = w
+                flux_example = f
+                break
+        if wave_example is None:
+            # no data => just skip
+            ax.set_title(f"{line_name} (no data)")
+            continue
+
+        # set axis limits
+        rest_wl = lines_info[line_name]['rest_wavelength']
+        window = lines_info[line_name]['window']
+        ax.set_xlim(rest_wl - window, rest_wl + window)
+        # approximate flux min, max from the example
+        fmin = np.min(flux_example)
+        fmax = np.max(flux_example)
+        ax.set_ylim(fmin * 0.50, fmax * 1.05 if fmax > 0 else 1.1)
         ax.set_xlabel("Wavelength (Å)")
         ax.set_ylabel("Flux")
-        ax.set_title(line_name)
+        ax.set_title(f"{line_name}", fontsize=12)
 
-        # Initialize the line artist
-        line_artist, = ax.plot([], [], lw=2)
-        line_artists[line_name] = line_artist
-        titles[line_name] = ax.set_title(line_name, fontsize=10)
+        # create a line artist
+        (lref,) = ax.plot([], [], color='b', lw=2)
+        line_artists[line_name] = lref
 
-    def init():
-        for line_name in line_artists:
-            line_artists[line_name].set_data([], [])
+    def init_func():
+        # set everything to empty
+        for ln in line_names:
+            if ln in line_artists:
+                line_artists[ln].set_data([], [])
         return list(line_artists.values())
 
-    def update(frame):
-        # Update each line
-        for line_name in line_artists:
-            w, f = line_data[line_name][frame]
-            if w is not None and f is not None:
-                line_artists[line_name].set_data(w, f)
+    def update_func(frame):
+        # each line => update data from line_data
+        for ln in line_names:
+            w, f = line_data[ln][frame]
+            if w is not None and f is not None and ln in line_artists:
+                line_artists[ln].set_data(w, f)
         return list(line_artists.values())
 
-    ani = animation.FuncAnimation(fig, update, frames=len(observations), init_func=init,
-                                  blit=True, interval=500)  # Adjust interval for speed
+    ani = animation.FuncAnimation(fig, update_func, frames=len(observations),
+                                  init_func=init_func, interval=800, blit=True)
 
-    # Save the animation as a GIF if specified
     if output_gif:
-        ani.save(output_gif, writer="pillow", fps=8)
-        print(f"Animation saved to {output_gif}")
+        ani.save(output_gif, writer='pillow', fps=6)
+        print(f"Animation saved => {output_gif}")
     else:
         plt.show()
 
 
-# Input folder
-input_folder = '/Users/tomsayada/PycharmProjects/BLOeM/source/obs/'  # Update with your folder path
+###############################################################################
+def main():
+    print("Select a folder containing observation files (FITS or text).")
+    root = tk.Tk()
+    root.withdraw()
+    folder_path = filedialog.askdirectory(title="Select folder with obs_... or BLOeM_... files")
+    root.destroy()
 
-# Run the animation
-animate_spectrum(input_folder, lines_info, output_gif=None)
+    if not folder_path:
+        print("No folder selected => exit.")
+        sys.exit(1)
+
+    # Example usage: animate the lines, optionally ask user for a GIF name
+    out_gif = None
+    # out_gif = os.path.join(folder_path, "spectra_animation.gif")  # if you want a default
+
+    animate_spectrum(folder_path, lines_info, output_gif=out_gif)
+
+
+if __name__ == "__main__":
+    main()

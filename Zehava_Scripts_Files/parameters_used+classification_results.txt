@@ -1,0 +1,9 @@
+Parameters used:
+tolerance = 4
+P = 0.05
+Classification Results Summary:
+SB1/RV var/RV constant = 240
+window_H = 30
+window_He = 40
+SB2 = 25
+Review again = 43

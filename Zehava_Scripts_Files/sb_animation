@@ -1,0 +1,155 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from scipy.optimize import curve_fit
+import astropy.io.fits as fits
+
+WhatToRead = 'FITS'
+clight = 2.99792458E5
+
+def gaussian(x, a, x0, sigma):
+    """Gaussian function for fitting absorption lines."""
+    return a * np.exp(-(x - x0)**2 / (2 * sigma**2))
+
+def find_line_center(wavelengths, flux, line_wavelength, window):
+    """
+    Fit a Gaussian to the absorption line to find its center wavelength.
+    """
+    # Define the range around the line to fit
+    mask = (wavelengths >= line_wavelength - window / 2) & (wavelengths <= line_wavelength + window / 2)
+    x = wavelengths[mask]
+    y = flux[mask]
+
+    # Invert flux for absorption line (Gaussian fits peaks)
+    y_inv = 1 - y / np.max(y)
+
+    # Initial guesses for Gaussian parameters
+    p0 = [np.min(y_inv), line_wavelength, 1.0]
+
+    try:
+        # Fit Gaussian to the line
+        popt, _ = curve_fit(gaussian, x, y_inv, p0=p0)
+        return popt[1]  # Return the center wavelength (x0)
+    except:
+        return line_wavelength  # Return default if fit fails
+
+def load_observation_files(input_folder, spectral_lines):
+    """
+    Load observation files and find line centers for each absorption line.
+    """
+    if WhatToRead == 'TXT':
+        files = sorted(
+        [f for f in os.listdir(input_folder) if f.startswith('obs_') and not f.endswith('.gif')],
+        key=lambda x: int(x.split('_')[1].split('.')[0])  # Safely handle extensions
+    )
+    elif WhatToRead == 'FITS':
+       files = sorted(
+       [f for f in os.listdir(input_folder) if f.startswith('BLOeM') and not f.endswith('.gif')],
+       key=lambda x: int(x.split('_')[2])
+        )
+    observations = {line: [] for line in spectral_lines}
+    observations_rv = []
+
+    for file in files:
+        file_path = os.path.join(input_folder, file)
+
+        try:
+            if WhatToRead == 'TXT':
+            # Load wavelengths and flux
+               data = np.loadtxt(file_path, skiprows=1)
+               wavelengths, flux = data[:, 0], data[:, 1]
+            elif WhatToRead == 'FITS':
+                with fits.open(file_path) as hdul:
+                   data = hdul[1].data
+                   wavelengths = data['WAVELENGTH']
+                   flux = data['SCI_NORM']
+        except:
+            continue
+
+        for line_name, line_data in spectral_lines.items():
+            rest_wavelength = line_data['wavelength']
+            window = line_data['window']
+
+            # Find line center and calculate Doppler shift
+            measured_center = find_line_center(wavelengths, flux, rest_wavelength, window)
+            delta_lambda = measured_center - rest_wavelength
+            doppler_shift = wavelengths - delta_lambda  # Shift to rest frame
+            doppler_velocity =(delta_lambda/rest_wavelength)*clight
+
+            # Collect shifted data
+            mask = (doppler_shift >= rest_wavelength - window / 2) & (doppler_shift <= rest_wavelength + window / 2)
+            observations[line_name].append((doppler_shift[mask], flux[mask]))
+
+    return observations
+
+def animate_spectrum(input_folder, spectral_lines, output_gif):
+    """
+    Animate the spectra shifted to line centers for all absorption lines, shown in three subplots.
+    """
+    observations = load_observation_files(input_folder, spectral_lines)
+
+    # Check if observations were loaded
+    if not any(observations.values()):
+        print("No observations found in the specified folder or wavelength range.")
+        return
+
+    # Create figure and subplots for each spectral line
+    fig, axes = plt.subplots(1, 5, figsize=(15, 5))
+    fig.suptitle("Spectra Aligned to Rest-Frame Line Centers",  fontsize=14)
+    plt.tight_layout()
+    lines = []
+    titles = []
+
+    # Initialize subplots
+    for ax, (line_name, line_data) in zip(axes, spectral_lines.items()):
+        ax.set_xlabel("Wavelength (Å)")
+        ax.set_ylabel("Flux")
+        ax.set_xlim(line_data['wavelength'] - line_data['window'] / 2,
+                    line_data['wavelength'] + line_data['window'] / 2)
+        ax.set_ylim(0.4, 1.1)  # Adjust flux range as needed
+        title = ax.set_title(f"{line_name}")
+        line, = ax.plot([], [], lw=2)
+        lines.append(line)
+        titles.append(title)
+
+    # Function to initialize animation
+    def init():
+        for line in lines:
+            line.set_data([], [])
+        return lines + titles
+
+    # Function to update animation
+    def update(frame):
+        for i, line_name in enumerate(spectral_lines.keys()):
+            wavelengths, flux = observations[line_name][frame]
+            lines[i].set_data(wavelengths, flux)
+            titles[i].set_text(f"{line_name} - Epoch {frame + 1}")            
+
+        return lines + titles
+
+    # Create animation
+    ani = animation.FuncAnimation(fig, update, frames=len(observations[list(spectral_lines.keys())[0]]),
+                                  init_func=init, blit=False, interval=500)
+
+    # Save the animation or display
+    if output_gif:
+        ani.save(output_gif, writer="pillow", fps=8)
+        print(f"Animation saved to {output_gif}")
+    else:
+        plt.show()
+
+# Define spectral lines
+spectral_lines = {
+    'He4471': {'wavelength': 4471.5, 'window': 20.0},
+    'He4026': {'wavelength': 4026.0, 'window': 20.0},
+    'He4388': {'wavelength': 4388.0, 'window': 20.0},
+    'H4340': {'wavelength': 4340.468, 'window': 20.0},
+    'H4100': {'wavelength': 4101.734, 'window': 20.0},
+
+}
+
+input_folder = r'/Users/zehavakatabi/Desktop/physics/Massive stars/Sample_BLOeM dr4/b dwarfs/4-092'
+#input_folder = r'/Users/zehavakatabi/Desktop/physics/Massive stars/Mock spectra/flux_0.5,e_0.2,S2N_100,Res_6400,P_800,K1_50.0,K2_30.0/4'
+#output_gif =  r'/Users/zehavakatabi/Desktop/physics/gifs/animation.gif'
+animate_spectrum(input_folder, spectral_lines, output_gif=None)

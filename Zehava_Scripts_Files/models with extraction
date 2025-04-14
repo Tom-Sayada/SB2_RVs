@@ -1,0 +1,33 @@
+import numpy as np
+import pandas as pd
+from tkinter import filedialog
+import os
+
+
+BLOeM_id = r'/Users/zehavakatabi/Desktop/physics/Massive stars/sample_id/id,B dwarf copy.txt'
+models = r'/Users/zehavakatabi/Desktop/physics/models4tomer_students/models4tomer_students.csv'
+
+PathToOutput = r'/Users/zehavakatabi/Desktop/physics/model for b dwarfs/models, txt'
+#PathToOutput = filedialog.askdirectory(title='Select Output Folder')
+if not PathToOutput:
+    PathToOutput = r''
+    print("No output folder selected, using default path.")
+
+df =pd.read_csv(models)
+
+with open(BLOeM_id, 'r') as f:
+    BLOeM_ids = [line.strip() for line in f]
+
+for bloem_id in BLOeM_ids:
+    col_name = f"BLOeM_{bloem_id}"
+    w = df['wavelength'].values
+    m = df[col_name].values
+    inrange = (w>= 3970) & (w<= 4550)  
+    w=w[inrange]
+    m=m[inrange]
+    out_csv = os.path.join(PathToOutput, f"model_BLOeM_{bloem_id}.txt")
+    Mask_columns = np.column_stack([w,m])
+    np.savetxt(out_csv, Mask_columns,delimiter=" ",header= "wavelength flux", comments="", fmt="%.15f")
+
+print("Done!")
+

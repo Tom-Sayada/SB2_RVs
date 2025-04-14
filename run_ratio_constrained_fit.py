@@ -3,7 +3,7 @@
 
 """
 Implementation of ratio + v_sys approach:
-  (rv1 + v_sys) = - (ratio)*(rv2 + v_sys)
+  (rv1 + v_sys) = - ratio * (rv2 + v_sys)
 
 Auto-locates standard-fit JSON if not provided, uses linear regression of (rv1, rv2)
 to guess ratio & v_sys, and sets rv2_epoch for each epoch in the ratio-based fit.
@@ -38,173 +38,32 @@ from src.plot_results import report_fit_results
 
 
 ###############################################################################
-# (1) Utility Helpers to detect/update suspicious parameter uncertainties
+# (1) Helper to compute global chi^2 from final params
 ###############################################################################
-def any_parameter_uncertainty_zero_or_nan(result, param_names=None):
+def compute_global_chi2(params, minimizer,
+                        fit_wv, fit_fl, fit_ep, fit_un,
+                        central_wavelengths,
+                        profile_type, line_profile,
+                        weighted=True,
+                        fit_baseline=False):
     """
-    Check if any param in 'param_names' has .stderr == None, 0.0, or NaN.
-    If param_names is None, we check all parameters in result.
+    Compute total sum of squared residuals across all lines/epochs
+    by calling the same residual function used in Minimizer.
     """
-    if param_names is None:
-        param_names = list(result.params.keys())
-    for pname in param_names:
-        if pname not in result.params:
-            continue
-        p = result.params[pname]
-        # If .stderr is None, 0.0, or NaN => suspicious
-        if p.stderr is None or p.stderr == 0.0 or np.isnan(p.stderr):
-            return True
-    return False
-
-
-def update_uncertainties_from_mcmc(result, mcmc_chain, param_names=None):
-    """
-    For each parameter in 'param_names', set .stderr = std dev from MCMC samples.
-    If param_names=None, do it for all parameters that appear in the chain.
-    """
-    import numpy as np
-    if param_names is None:
-        param_names = mcmc_chain.columns  # all MCMC param names
-
-    for pname in param_names:
-        if pname in result.params and pname in mcmc_chain.columns:
-            chain_vals = mcmc_chain[pname].values
-            std_val = np.std(chain_vals)
-            old_stderr = result.params[pname].stderr
-            result.params[pname].stderr = std_val
-            print(f"[MCMC] Overriding param '{pname}' stderr={old_stderr} => {std_val:.4f}")
+    res = minimizer.userfcn(
+        params,
+        fit_wv, fit_fl, fit_ep, fit_un, central_wavelengths,
+        profile_type=profile_type,
+        line_profile=line_profile,
+        weighted=weighted,
+        fit_baseline=fit_baseline
+    )
+    chi2 = np.sum(res**2)
+    return chi2
 
 
 ###############################################################################
-# (2) Callback for Basin-Hopping
-###############################################################################
-class BasinHoppingCallback:
-    """Simple progress bar for basin-hopping iterations."""
-    def __init__(self, niter):
-        self.niter = niter
-        self.current = 0
-        self.pbar = tqdm(total=niter, desc="Basin hopping")
-
-    def __call__(self, x, f, accept):
-        self.current += 1
-        self.pbar.update(1)
-        return False
-
-    def close(self):
-        self.pbar.close()
-
-
-###############################################################################
-# (3) Logic to auto-locate a standard-fit JSON
-###############################################################################
-def auto_locate_standard_json(data_dir, profile_type, line_profile, use_weighted, fit_baseline):
-    """
-    Attempt to guess where the standard-fit JSON might be, e.g.:
-    data_dir / standard_{profile_type}_{line_profile}_{weighted|unweighted}_{baseline|nobaseline}_fit_results / standard_fit_params.json
-    """
-    w_str = "weighted" if use_weighted else "unweighted"
-    b_str = "baseline" if fit_baseline else "nobaseline"
-    subfolder = f"standard_{profile_type}_{line_profile}_{w_str}_{b_str}_fit_results"
-    candidate_json = os.path.join(data_dir, subfolder, "standard_fit_params.json")
-    if os.path.exists(candidate_json):
-        return candidate_json
-    return None
-
-
-def load_standard_fit_json(json_path):
-    """
-    Loads the standard-fit parameters from a JSON.
-    This is used to get initial guesses for line shapes + an approximate idea of rv2.
-    """
-    if not os.path.isfile(json_path):
-        print(f"Warning: no JSON found at: {json_path}")
-        return {}
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    out = {}
-    for k, subd in data.items():
-        val = subd.get("value", 0.0)
-        vmin = subd.get("min", None)
-        vmax = subd.get("max", None)
-        out[k] = (val, vmin, vmax)
-    print(f"Loaded {len(out)} parameters from standard-fit JSON: {json_path}")
-    return out
-
-
-###############################################################################
-# (4) Derive ratio + v_sys from linear fit of (rv1, rv2) if we have them
-###############################################################################
-def derive_ratio_vsys_linfit(standard_params):
-    """
-    If we have a standard-fit solution with rv1_epoch and rv2_epoch for each epoch,
-    we attempt a linear fit: rv1 = intercept + slope*rv2 => ratio, v_sys from slope, intercept.
-    """
-    import numpy as np
-    rv_dict = {}
-    for name, (val, _, _) in standard_params.items():
-        if name.startswith("rv1_epoch"):
-            ep_str = name.replace("rv1_epoch", "")
-            try:
-                ep = int(ep_str)
-                rv_dict.setdefault(ep, [None, None])[0] = val
-            except:
-                pass
-        elif name.startswith("rv2_epoch"):
-            ep_str = name.replace("rv2_epoch", "")
-            try:
-                ep = int(ep_str)
-                rv_dict.setdefault(ep, [None, None])[1] = val
-            except:
-                pass
-
-    rv1_list = []
-    rv2_list = []
-    ep_list = []
-    for ep, (r1, r2) in sorted(rv_dict.items()):
-        if (r1 is not None) and (r2 is not None):
-            rv1_list.append(r1)
-            rv2_list.append(r2)
-            ep_list.append(ep)
-
-    if len(rv1_list) < 2:
-        # fallback if not enough data
-        ratio_est = 1.0
-        v_sys_est = 0.0
-        rv2_init_dict = {ep: (r2 if r2 else 0.0) for ep, (r1, r2) in rv_dict.items()}
-        return ratio_est, v_sys_est, rv2_init_dict
-
-    rv1_arr = np.array(rv1_list)
-    rv2_arr = np.array(rv2_list)
-
-    # Fit: rv1 = intercept + slope*rv2
-    slope, intercept = np.polyfit(rv2_arr, rv1_arr, 1)
-    b = slope
-    a = intercept
-
-    # ratio = -b, v_sys = -a / (ratio+1)
-    ratio_est = -b
-    if abs(ratio_est + 1) < 1e-8:
-        ratio_est = 1.0
-    v_sys_est = -a / (ratio_est + 1)
-
-    # Bound ratio
-    if ratio_est < 0.01:
-        ratio_est = 0.01
-    elif ratio_est > 20.0:
-        ratio_est = 20.0
-
-    # Build rv2_init
-    rv2_init_dict = {}
-    for ep, (r1, r2) in rv_dict.items():
-        if r2 is None:
-            r2 = 0.0
-        rv2_init_dict[ep] = r2
-
-    return ratio_est, v_sys_est, rv2_init_dict
-
-
-###############################################################################
-# (5) Main function
+# (2) Main script function
 ###############################################################################
 def main():
     parser = argparse.ArgumentParser(
@@ -214,8 +73,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="output_ratio_fit")
     parser.add_argument("--profile_type", type=str, default='sym')
     parser.add_argument("--line_profile", type=str, default='voigt',
-                       choices=['voigt', 'gaussian'],
-                       help="Profile type for stellar components")
+                        choices=['voigt', 'gaussian'],
+                        help="Profile type for stellar components")
     parser.add_argument("--lines", type=str, default=None)
     parser.add_argument("--unweighted", action='store_true')
     parser.add_argument("--fit_baseline", action='store_true')
@@ -263,6 +122,15 @@ def main():
         print("Will perform MCMC after final minimization => ±1σ flux envelopes.\n")
 
     # Possibly auto-locate JSON from standard fit
+    def auto_locate_standard_json(data_dir, profile_type, line_profile, use_weighted, fit_baseline):
+        w_str = "weighted" if use_weighted else "unweighted"
+        b_str = "baseline" if fit_baseline else "nobaseline"
+        subfolder = f"standard_{profile_type}_{line_profile}_{w_str}_{b_str}_fit_results"
+        candidate_json = os.path.join(data_dir, subfolder, "standard_fit_params.json")
+        if os.path.exists(candidate_json):
+            return candidate_json
+        return None
+
     if not args.init_params_json:
         auto_found = auto_locate_standard_json(
             data_dir=data_dir,
@@ -297,6 +165,9 @@ def main():
     plot_ep = OrderedDict()
     plot_noise = {}
 
+    # Dictionary to store MJD information for each epoch
+    mjd_dict = {}
+    from tqdm import tqdm
     # Build the arrays
     print(f"\nFound {len(epoch_files)} observation files. Building arrays now...")
     for (ep, filepath) in tqdm(epoch_files, desc="Loading data"):
@@ -304,25 +175,39 @@ def main():
         if df.empty:
             continue
 
+        # Store MJD if available
+        if hasattr(df, 'attrs') and 'MJD' in df.attrs:
+            mjd_dict[ep] = df.attrs['MJD']
+            print(f"Epoch {ep}: MJD = {df.attrs['MJD']}")
+        else:
+            mjd_dict[ep] = np.nan
+
         for ln_name, ln_info in spectral_lines.items():
-            line_id = f"line_{int(ln_info['rest_wave']*10)}"
+            line_id = f"line_{int(ln_info['rest_wave'] * 10)}"
             restw = ln_info['rest_wave']
             halfw = ln_info['window'] / 2.0
 
             # Large search
-            search_extra = 25.0
-            smin = restw - search_extra
-            smax = restw + search_extra
-            msearch = (df['wavelength'] >= smin) & (df['wavelength'] <= smax)
-            wv_search = df['wavelength'][msearch].values
-            fl_search = df['flux'][msearch].values
+            # Find approximate line center with a WIDER initial search (especially for high-velocity systems)
+            search_extra = 25.0  # Increase from 25.0 to catch more shifted lines
+            search_min = restw - search_extra
+            search_max = restw + search_extra
+            mask_search = (df['wavelength'] >= search_min) & (df['wavelength'] <= search_max)
+            wv_search = df['wavelength'][mask_search].values
+            fl_search = df['flux'][mask_search].values
             if len(wv_search) < 5:
                 continue
 
+            # Find the actual line center
             found_center = find_line_center_smoothed(wv_search, fl_search, sigma=1.0, absorption=True)
             if found_center is None:
                 found_center = restw
+            else:
+                # Print diagnostic to see how much the center shifted
+                print(
+                    f"Line {line_id}: Shift from rest {restw} to found {found_center:.2f} = {found_center - restw:.2f}Å")
 
+            # Then open the window around the FOUND center
             lw_min = found_center - halfw
             lw_max = found_center + halfw
             m_fit = (df['wavelength'] >= lw_min) & (df['wavelength'] <= lw_max)
@@ -331,7 +216,6 @@ def main():
             if len(wv_fit) == 0:
                 continue
 
-            # Noise
             nrs = find_noise_regions(df, lw_min, lw_max, noise_window=5, min_noise_separation=5)
             if nrs:
                 sig_list = []
@@ -413,17 +297,91 @@ def main():
     # Build central wavelength map
     central_map = {}
     for ln_name, ln_info in spectral_lines.items():
-        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        lid = f"line_{int(ln_info['rest_wave'] * 10)}"
         central_map[lid] = ln_info['rest_wave']
 
-    # Load guesses from standard-fit JSON if available
+    # Load standard-fit JSON if provided
+    def load_standard_fit_json(json_path):
+        if not os.path.isfile(json_path):
+            print(f"Warning: no JSON found at: {json_path}")
+            return {}
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        out = {}
+        for k, subd in data.items():
+            val = subd.get("value", 0.0)
+            vmin = subd.get("min", None)
+            vmax = subd.get("max", None)
+            out[k] = (val, vmin, vmax)
+        print(f"Loaded {len(out)} parameters from standard-fit JSON: {json_path}")
+        return out
+
     loaded_params = {}
     if args.init_params_json and os.path.exists(args.init_params_json):
         loaded_params = load_standard_fit_json(args.init_params_json)
     else:
         print("No standard-fit JSON path or file found => using default guesses.")
 
-    # Derive ratio + v_sys from standard RVs
+    def derive_ratio_vsys_linfit(standard_params):
+        import numpy as np
+        rv_dict = {}
+        for name, (val, _, _) in standard_params.items():
+            if name.startswith("rv1_epoch"):
+                ep_str = name.replace("rv1_epoch", "")
+                try:
+                    ep = int(ep_str)
+                    rv_dict.setdefault(ep, [None, None])[0] = val
+                except:
+                    pass
+            elif name.startswith("rv2_epoch"):
+                ep_str = name.replace("rv2_epoch", "")
+                try:
+                    ep = int(ep_str)
+                    rv_dict.setdefault(ep, [None, None])[1] = val
+                except:
+                    pass
+
+        rv1_list = []
+        rv2_list = []
+        ep_list = []
+        for ep, (r1, r2) in sorted(rv_dict.items()):
+            if (r1 is not None) and (r2 is not None):
+                rv1_list.append(r1)
+                rv2_list.append(r2)
+                ep_list.append(ep)
+
+        if len(rv1_list) < 2:
+            # fallback
+            ratio_est = 1.0
+            v_sys_est = 0.0
+            rv2_init_dict = {ep: (r2 if r2 else 0.0) for ep, (r1, r2) in rv_dict.items()}
+            return ratio_est, v_sys_est, rv2_init_dict
+
+        rv1_arr = np.array(rv1_list)
+        rv2_arr = np.array(rv2_list)
+
+        slope, intercept = np.polyfit(rv2_arr, rv1_arr, 1)
+        b = slope
+        a = intercept
+
+        ratio_est = -b
+        if abs(ratio_est + 1) < 1e-8:
+            ratio_est = 1.0
+        v_sys_est = -a / (ratio_est + 1)
+
+        # Bound ratio
+        if ratio_est < 0.01:
+            ratio_est = 0.01
+        elif ratio_est > 20.0:
+            ratio_est = 20.0
+
+        rv2_init_dict = {}
+        for ep, (r1, r2) in rv_dict.items():
+            if r2 is None:
+                r2 = 0.0
+            rv2_init_dict[ep] = r2
+        return ratio_est, v_sys_est, rv2_init_dict
+
     ratio_est = 1.0
     v_sys_est = 0.0
     rv2_init_dict = {}
@@ -440,7 +398,7 @@ def main():
         initial_rvs=rv2_init_dict
     )
 
-    # Overwrite line-shape param guesses from standard-fit if present
+    # Overwrite line-shape param guesses
     for p_name in params.keys():
         if p_name in loaded_params:
             val, vmin, vmax = loaded_params[p_name]
@@ -465,37 +423,99 @@ def main():
         }
     )
 
-    # Global search with BasinHopping
-    print("\nPerforming basin hopping optimization...")
-    callback = BasinHoppingCallback(niter=10)
-    try:
-        result_bh = minimizer.minimize(
-            method='basinhopping',
-            niter=10,
-            T=5.0,
-            stepsize=0.3,
-            callback=callback,
-            minimizer_kwargs={'method': 'L-BFGS-B'}
-        )
-    finally:
-        callback.close()
+    # Basin-hopping with multiple seeds
+    from tqdm import tqdm
 
-    # Refine with Levenberg-Marquardt
-    print("\nRefining with least squares...")
-    result_final = minimizer.minimize(
-        method='leastsq',
-        params=result_bh.params,
-        max_nfev=20000
-    )
+    class BasinHoppingCallback:
+        """Simple progress bar for basin-hopping iterations."""
+
+        def __init__(self, niter):
+            self.niter = niter
+            self.current = 0
+            self.pbar = tqdm(total=niter, desc="Basin hopping")
+
+        def __call__(self, x, f, accept):
+            self.current += 1
+            self.pbar.update(1)
+            return False
+
+        def close(self):
+            self.pbar.close()
+
+    seeds_to_try = [101, 202, 303]
+    best_seed = None
+    best_result_bh = None
+    best_chi2 = None
+
+    for s in seeds_to_try:
+        print(f"\n--- Basin hopping with seed={s}, niter=50 ---")
+        callback = BasinHoppingCallback(niter=50)
+        try:
+            temp_result_bh = minimizer.minimize(
+                method='basinhopping',
+                niter=50,
+                T=5.0,
+                stepsize=0.3,
+                callback=callback,
+                minimizer_kwargs={'method': 'L-BFGS-B'},
+                seed=s
+            )
+        finally:
+            callback.close()
+
+        # Refine with Levenberg-Marquardt
+        temp_result_ls = minimizer.minimize(
+            method='leastsq',
+            params=temp_result_bh.params,
+            max_nfev=20000
+        )
+
+        chi2_val = compute_global_chi2(temp_result_ls.params,
+                                       minimizer,
+                                       fit_wv, fit_fl, fit_ep, fit_un,
+                                       central_map,
+                                       profile_type, line_profile,
+                                       weighted=use_weighted,
+                                       fit_baseline=fit_baseline)
+        print(f"  => final chi^2 with seed={s}: {chi2_val:.2f}")
+
+        if (best_chi2 is None) or (chi2_val < best_chi2):
+            best_chi2 = chi2_val
+            best_result_bh = temp_result_ls
+            best_seed = s
+
+    print(f"\nBest seed: {best_seed}, best chi^2= {best_chi2:.2f}")
+    result_final = best_result_bh
 
     print("\n===== Final Fit Report =====\n")
     report_fit(result_final)
 
-    #####################################################################
-    # (A) Check if ratio.stderr / v_sys.stderr / rv2_epoch* .stderr are okay
-    #     If any are NaN/zero => run MCMC or if user explicitly wants MCMC
-    #####################################################################
-    # Collect parameters of interest to check (feel free to adjust):
+    # Check uncertainties
+    def any_parameter_uncertainty_zero_or_nan(result, param_names=None):
+        import numpy as np
+        if param_names is None:
+            param_names = list(result.params.keys())
+        for pname in param_names:
+            if pname not in result.params:
+                continue
+            p = result.params[pname]
+            if p.stderr is None or p.stderr == 0.0 or np.isnan(p.stderr):
+                return True
+        return False
+
+    def update_uncertainties_from_mcmc(result, mcmc_chain, param_names=None):
+        import numpy as np
+        if param_names is None:
+            param_names = mcmc_chain.columns
+        for pname in param_names:
+            if (pname in result.params) and (pname in mcmc_chain.columns):
+                chain_vals = mcmc_chain[pname].values
+                std_val = np.std(chain_vals)
+                old_stderr = result.params[pname].stderr
+                result.params[pname].stderr = std_val
+                print(f"[MCMC] Overriding param '{pname}' stderr={old_stderr} => {std_val:.4f}")
+
+    # Collect parameters of interest
     param_list_to_check = []
     if 'ratio' in result_final.params:
         param_list_to_check.append('ratio')
@@ -505,23 +525,18 @@ def main():
         if pname.startswith("rv2_epoch"):
             param_list_to_check.append(pname)
 
-    suspicious_uncert = any_parameter_uncertainty_zero_or_nan(
-        result_final, param_names=param_list_to_check
-    )
-
+    suspicious_uncert = any_parameter_uncertainty_zero_or_nan(result_final, param_list_to_check)
     do_post_mcmc = user_requested_mcmc or suspicious_uncert
     if suspicious_uncert:
         print("Some parameter .stderr is NaN or zero => Running MCMC to refine parameter errors.\n")
 
-    #####################################################################
-    # (B) If needed, run MCMC & update .stderr from posterior
-    #####################################################################
     mcmc_chain = None
     if do_post_mcmc:
         print("Performing MCMC sampling (emcee) ...\n")
+        best_params = result_final.params.copy()
         result_mcmc = minimizer.minimize(
             method='emcee',
-            params=result_final.params.copy(),
+            params=best_params,
             steps=2000,
             nwalkers=150,
             burn=300,
@@ -532,16 +547,14 @@ def main():
         mcmc_chain = result_mcmc.flatchain
         print(f"MCMC chain shape: {mcmc_chain.shape}")
 
-        # Overwrite the ratio/v_sys/rv2_epoch* uncertainties with MCMC stdev:
-        update_uncertainties_from_mcmc(result_final, mcmc_chain, param_names=param_list_to_check)
+        update_uncertainties_from_mcmc(result_final, mcmc_chain, param_list_to_check)
 
-    # Prepare for final plots
+    # Final summary + plots
     windows_map = {}
     for ln_name, ln_info in spectral_lines.items():
-        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        lid = f"line_{int(ln_info['rest_wave'] * 10)}"
         windows_map[lid] = ln_info['window']
 
-    # Generate final report, plots, etc.
     df_res, df_chi = report_fit_results(
         result=result_final,
         wavelengths_line=fit_wv,
@@ -554,17 +567,17 @@ def main():
         output_directory=out_dir,
         profile_type=profile_type,
         line_profile=line_profile,
-        # For final bigger plot arrays:
         plot_wavelengths_line=plot_wv,
         plot_fluxes_line=plot_fl,
         plot_uncertainties_line=plot_un,
         plot_epochs_line=plot_ep,
         plot_noise_dict=plot_noise,
-        mcmc_chain=mcmc_chain   # <--- pass chain to see ±1σ fill
+        mcmc_chain=mcmc_chain,
+        mjd_dict=mjd_dict
     )
 
     print(f"\nAll done. Results saved in {out_dir}\n")
-    # Print final ratio, v_sys
+
     if 'ratio' in result_final.params:
         rv_ratio = result_final.params['ratio']
         print(f"Final ratio = {rv_ratio.value:.3f} ± {rv_ratio.stderr or 0.0:.3f}")

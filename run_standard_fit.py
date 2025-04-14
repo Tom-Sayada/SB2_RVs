@@ -16,8 +16,8 @@ from src.utils import (
     find_line_center_smoothed
 )
 from src.model_builder import (
-    setup_parameters,     # standard approach
-    residuals            # standard approach
+    setup_parameters,  # standard approach
+    residuals  # standard approach
 )
 from src.plot_results import report_fit_results
 
@@ -35,6 +35,27 @@ class BasinHoppingCallback:
 
     def close(self):
         self.pbar.close()
+
+
+def compute_global_chi2(params, minimizer,
+                        fit_wv, fit_fl, fit_ep, fit_un,
+                        central_map,
+                        profile_type, line_profile,
+                        weighted=True):
+    """
+    Compute total chi^2 = sum of (residuals^2) for all lines/epochs,
+    given the current params. Re-uses the 'residuals' function from model_builder.
+    """
+    # We call the same residual function that Minimizer uses
+    res = minimizer.userfcn(
+        params,  # current parameters
+        fit_wv, fit_fl, fit_ep, fit_un, central_map,
+        profile_type=profile_type,
+        line_profile=line_profile,
+        weighted=weighted
+    )
+    chi2 = np.sum(res**2)
+    return chi2
 
 
 def save_bestfit_params_to_json(params, filepath):
@@ -89,11 +110,10 @@ def main():
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="output_fit_results")
 
-    # The main profile (sym/asym) + line_profile (voigt/gaussian):
     parser.add_argument("--profile_type", type=str, default='sym')
     parser.add_argument("--line_profile", type=str, default='voigt',
-                       choices=['voigt', 'gaussian'],
-                       help="Profile type for stellar components")
+                        choices=['voigt', 'gaussian'],
+                        help="Profile type for stellar components")
 
     parser.add_argument("--lines", type=str, default=None,
                         help="Comma-separated e.g. 'He4471,He4026,H4340'")
@@ -118,11 +138,13 @@ def main():
 
     # Example lines
     all_lines_info = {
-        'He4471': {'rest_wave': 4471.5, 'window': 20.0},
-        'He4026': {'rest_wave': 4026.0, 'window': 20.0},
-        'He4388': {'rest_wave': 4388.0, 'window': 20.0},
-        'H4340':  {'rest_wave': 4340.472, 'window': 20.0},
-        'H4101': {'rest_wave': 4101, 'window': 20.0}
+        'He4471': {'rest_wave': 4471.5, 'window': 11.0},
+        'He4026': {'rest_wave': 4026.0, 'window': 25.0},
+        'He4388': {'rest_wave': 4388.0, 'window': 13.0},
+        'H4340':  {'rest_wave': 4340.472, 'window': 30.0},
+        'H4101':  {'rest_wave': 4101,     'window': 22.0},
+        'He4144': {'rest_wave': 4144, 'window': 10.0},
+        'He4120': {'rest_wave': 4120, 'window': 13.0}
     }
 
     # If user specified lines
@@ -163,6 +185,9 @@ def main():
     plot_ep = OrderedDict()
     plot_noise = {}
 
+    # Dictionary to store MJD information for each epoch
+    mjd_dict = {}
+
     # Initialize
     for ln_name, ln_info in spectral_lines.items():
         line_id = f"line_{int(ln_info['rest_wave'] * 10)}"
@@ -184,14 +209,21 @@ def main():
         if df.empty:
             continue
 
+        # Store MJD if available
+        if hasattr(df, 'attrs') and 'MJD' in df.attrs:
+            mjd_dict[ep] = df.attrs['MJD']
+            print(f"Epoch {ep}: MJD = {df.attrs['MJD']}")
+        else:
+            mjd_dict[ep] = np.nan
+
         # For each line
         for ln_name, ln_info in spectral_lines.items():
-            line_id = f"line_{int(ln_info['rest_wave']*10)}"
+            line_id = f"line_{int(ln_info['rest_wave'] * 10)}"
             restw = ln_info['rest_wave']
             halfw = ln_info['window'] / 2.0
 
-            # Big search window
-            search_extra = 25.0
+            # Find approximate line center with a WIDER initial search (especially for high-velocity systems)
+            search_extra = 25.0  # Increase from 25.0 to catch more shifted lines
             search_min = restw - search_extra
             search_max = restw + search_extra
             mask_search = (df['wavelength'] >= search_min) & (df['wavelength'] <= search_max)
@@ -200,12 +232,35 @@ def main():
             if len(wv_search) < 5:
                 continue
 
-            # Find approximate line center
+            # Find the actual line center
             found_center = find_line_center_smoothed(wv_search, fl_search, sigma=1.0, absorption=True)
             if found_center is None:
                 found_center = restw
+            else:
+                # Print diagnostic to see how much the center shifted
+                print(
+                    f"Line {line_id}: Shift from rest {restw} to found {found_center:.2f} = {found_center - restw:.2f}Å")
 
-            # Final narrower window
+                # --- NEW PLOTTING CODE ---
+                import matplotlib.pyplot as plt
+                from scipy.ndimage import gaussian_filter1d
+
+                # Smooth the flux using the same sigma as the finder
+                smoothed_flux = gaussian_filter1d(fl_search, sigma=1.0)
+
+                plt.figure(figsize=(8, 4))
+                plt.plot(wv_search, fl_search, 'b-', label='Original Flux')
+                plt.plot(wv_search, smoothed_flux, 'r-', label='Smoothed Flux')
+                plt.axvline(found_center, color='g', linestyle='--', label=f'Found Center: {found_center:.2f} Å')
+                plt.xlabel("Wavelength (Å)")
+                plt.ylabel("Flux")
+                plt.title(f"Line {line_id}: Found Center")
+                plt.legend()
+                plt.tight_layout()
+                #plt.show()
+                # ---------------------------
+
+            # Then open the window around the FOUND center
             lw_min = found_center - halfw
             lw_max = found_center + halfw
             mask_fit = (df['wavelength'] >= lw_min) & (df['wavelength'] <= lw_max)
@@ -303,7 +358,7 @@ def main():
     # Map line ID -> rest wavelength
     central_map = {}
     for ln_name, ln_info in spectral_lines.items():
-        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        lid = f"line_{int(ln_info['rest_wave'] * 10)}"
         central_map[lid] = ln_info['rest_wave']
 
     # Setup standard approach parameters
@@ -327,26 +382,52 @@ def main():
         }
     )
 
-    # Basin hopping
-    callback = BasinHoppingCallback(niter=10)
-    try:
-        result_bh = minimizer.minimize(
-            method='basinhopping',
-            niter=10,
-            T=5.0,
-            stepsize=0.3,
-            callback=callback,
-            minimizer_kwargs={'method': 'L-BFGS-B'}
-        )
-    finally:
-        callback.close()
+    # ======================================
+    #  Basin hopping with multiple seeds
+    # ======================================
+    seeds_to_try = [101]  # customize as you want
+    best_seed = None
+    best_result_bh = None
+    best_chi2 = None
 
-    print("\nRefining with least squares...")
-    result_final = minimizer.minimize(
-        method='leastsq',
-        params=result_bh.params,
-        max_nfev=20000
-    )
+    for s in seeds_to_try:
+        print(f"\n--- Basin hopping with seed={s}, niter=10 ---")
+        callback = BasinHoppingCallback(niter=10)
+        try:
+            temp_result_bh = minimizer.minimize(
+                method='basinhopping',
+                niter=10,
+                T=5.0,
+                stepsize=0.3,
+                callback=callback,
+                minimizer_kwargs={'method': 'L-BFGS-B'},
+                seed=s
+            )
+        finally:
+            callback.close()
+
+        # Refine with leastsq from that BH solution
+        temp_result_ls = minimizer.minimize(
+            method='leastsq',
+            params=temp_result_bh.params,
+            max_nfev=20000
+        )
+
+        # Evaluate total chi^2
+        chi2_val = compute_global_chi2(temp_result_ls.params, minimizer,
+                                       fit_wv, fit_fl, fit_ep, fit_un,
+                                       central_map,
+                                       profile_type, line_profile,
+                                       weighted=use_weighted)
+        print(f"  => final chi^2 with seed={s}: {chi2_val:.2f}")
+
+        if (best_chi2 is None) or (chi2_val < best_chi2):
+            best_chi2 = chi2_val
+            best_result_bh = temp_result_ls
+            best_seed = s
+
+    print(f"\nBest seed: {best_seed}, best chi^2= {best_chi2:.2f}")
+    result_final = best_result_bh
 
     print("\n===== Fit Report =====\n")
     report_fit(result_final)
@@ -366,10 +447,10 @@ def main():
         result_mcmc = minimizer.minimize(
             method='emcee',
             params=best_params,
-            steps=3000,       # total MCMC steps
-            nwalkers=150,     # number of MCMC walkers
-            burn=300,         # discard first 300 steps
-            thin=20,          # keep only every 20th step
+            steps=2000,  # total MCMC steps
+            nwalkers=200,  # number of MCMC walkers
+            burn=500,  # discard first 300 steps
+            thin=5,  # keep only every 15th step
             is_weighted=use_weighted,
             seed=123
         )
@@ -382,12 +463,9 @@ def main():
     # Summaries & final plots
     windows_map = {}
     for ln_name, ln_info in spectral_lines.items():
-        lid = f"line_{int(ln_info['rest_wave']*10)}"
+        lid = f"line_{int(ln_info['rest_wave'] * 10)}"
         windows_map[lid] = ln_info['window']
 
-    # ------------------------------------------------------------------
-    # IMPORTANT FIX: pass line_profile=line_profile into report_fit_results
-    # ------------------------------------------------------------------
     df_res, df_chi = report_fit_results(
         result=result_final,
         wavelengths_line=fit_wv,
@@ -399,22 +477,21 @@ def main():
         windows=windows_map,
         output_directory=out_dir,
         profile_type=profile_type,
-        line_profile=line_profile,  # <-- THIS ensures we use the correct profile in plotting
-        # bigger arrays for final plotting
+        line_profile=line_profile,
         plot_wavelengths_line=plot_wv,
         plot_fluxes_line=plot_fl,
         plot_uncertainties_line=plot_un,
         plot_epochs_line=plot_ep,
         plot_noise_dict=plot_noise,
-        mcmc_chain=mcmc_chain
+        mcmc_chain=mcmc_chain,
+        mjd_dict=mjd_dict
     )
 
     print(f"\nAll done. Results in {out_dir}\n")
 
-    # Save best-fit parameters to JSON for ratio fit, etc.
+    # Save best-fit parameters to JSON
     save_bestfit_params_to_json(result_final.params, os.path.join(out_dir, save_path))
 
 
 if __name__ == "__main__":
     main()
-
